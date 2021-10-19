@@ -1,0 +1,242 @@
+Parameters:
+  LatestLinuxAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+  BucketName:
+    AllowedPattern: '^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$'
+    ConstraintDescription: >-
+      Quick Start bucket name can include numbers, lowercase letters, uppercase
+      letters, and hyphens (-). It cannot start or end with a hyphen (-).
+    Default: 'your-bucket-name'
+    Description: >-
+      S3 bucket name for the Swarm Stack yml file.
+    Type: String
+  
+Resources:
+  host1:
+    Type: AWS::EC2::Instance
+    Metadata:
+        AWS::CloudFormation::Init:
+          configSets:
+            default:
+              - install_docker
+              - initiate_swarm
+              - get_and_store_swarm_token
+              - swarm_stack
+          install_docker:
+            packages:
+              yum:
+                docker: []
+            services:
+              sysvinit:
+                docker:
+                  enabled: "true"
+                  ensureRunning: "true"
+          initiate_swarm:
+              commands:
+                initiate_swarm:
+                  command: "sudo docker swarm init"
+          get_and_store_swarm_token:
+              commands:
+                get_and_store_token:
+                  command: !Sub |
+                    SWARM_TOKEN=$(sudo docker swarm join-token -q worker)
+                    echo 'export SWARM_TOKEN="'$SWARM_TOKEN'"'>> ~/.bashrc
+                    # refresh the bash
+                    source ~/.bashrc
+                    #aws ssm command
+                    aws ssm put-parameter --name "SwarmToken" --type "SecureString" --value $SWARM_TOKEN --overwrite --region ${AWS::Region}
+          swarm_stack:
+              commands:
+                copy_stack:
+                  command: !Sub | 
+                    aws s3 cp s3://${BucketName}/wordpress_stack.yml /tmp 
+                deploy_stack:
+                  command: 
+                    sudo docker stack deploy -c /tmp/wordpress_stack.yml wordpress
+    # CreationPolicy:
+    #     ResourceSignal:
+    #         Timeout: PT5M
+    Properties:
+      ImageId: !Ref LatestLinuxAmiId
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SecurityGroups:
+        - !Ref DockerSG
+      Tags: 
+      - Key: "Name"
+        Value: "host1"
+      # we install our host with user data
+      UserData: 
+        Fn::Base64:
+            !Sub |
+              #!/bin/bash -xe
+              # Get the latest CloudFormation package
+              yum update -y aws-cfn-bootstrap
+              # Start cfn-init
+              /opt/aws/bin/cfn-init -v -s ${AWS::StackId} -r host1 --region ${AWS::Region}
+              # All done, signal success
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource host1 --region ${AWS::Region}
+
+  host2:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+            default:
+              - install_docker
+              - join_swarm_worker
+        install_docker:
+            packages:
+                yum:
+                  docker: []
+            services:
+                sysvinit:
+                  docker:
+                    enabled: "true"
+                    ensureRunning: "true"
+        join_swarm_worker:
+            commands:
+                join_swarm_worker:
+                  command: !Sub |
+                    JOIN_TOKEN=$(aws ssm get-parameter --name SwarmToken --region ${AWS::Region} --with-decryption --output text --query Parameter.Value)
+                    echo 'export JOIN_TOKEN="'$JOIN_TOKEN'"'>> ~/.bashrc
+                    # refresh the bash
+                    source ~/.bashrc
+                    #join swarm as worker
+                    sudo docker swarm join --token $JOIN_TOKEN ${host1.PrivateIp}
+    DependsOn: host1
+    # CreationPolicy:
+    #     ResourceSignal:
+    #         Timeout: PT5M
+    Properties:
+      ImageId: !Ref LatestLinuxAmiId
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SecurityGroups:
+        - !Ref DockerSG
+      Tags: 
+      - Key: "Name"
+        Value: "host2"
+      # we install our web server with user data
+      UserData: 
+        Fn::Base64:
+            !Sub |
+              #!/bin/bash -xe
+              # Get the latest CloudFormation package
+              yum update -y aws-cfn-bootstrap
+              # Start cfn-init
+              /opt/aws/bin/cfn-init -s ${AWS::StackId} -r host2 --region ${AWS::Region}
+              # All done, signal success
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource host2 --region ${AWS::Region}
+ 
+# Instance profile for EC2
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: ec2-instance-profile
+      Roles: 
+       - !Ref SSMRoleForEc2
+
+  # Role for SSM
+  SSMRoleForEc2:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+       - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  
+  PolicieSSM: 
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: "ssm_param"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: 
+              - "ssm:PutParameter"
+              - "ssm:GetParameter"
+            Resource: "*"
+      Roles: 
+        - Ref: "SSMRoleForEc2"
+
+  PolicieS3: 
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: "get_obj"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+            - Effect: Allow
+              Action: 's3:GetObject'
+              Resource: !Sub 'arn:aws:s3:::${BucketName}/*'          
+      Roles: 
+        - Ref: "SSMRoleForEc2" 
+
+  # our EC2 security group
+  DockerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for Docker Swarm
+  
+  # Sg Ingress selfreferencing
+  SGDockerIn2377:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DockerSG.GroupId
+      FromPort: 2377
+      IpProtocol: tcp
+      ToPort: 2377
+      SourceSecurityGroupId: !GetAtt DockerSG.GroupId
+    
+  SGDockerIn7946:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DockerSG.GroupId
+      FromPort: 7946
+      IpProtocol: tcp
+      ToPort: 7946
+      SourceSecurityGroupId: !GetAtt DockerSG.GroupId
+
+  SGDockerIn7946udp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DockerSG.GroupId
+      FromPort: 7946
+      IpProtocol: udp
+      ToPort: 7946
+      SourceSecurityGroupId: !GetAtt DockerSG.GroupId
+
+  SGDockerIn4798:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DockerSG.GroupId
+      FromPort: 4789
+      IpProtocol: udp
+      ToPort: 4798
+      SourceSecurityGroupId: !GetAtt DockerSG.GroupId
+  
+  SGDockerIn80:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !GetAtt DockerSG.GroupId
+      IpProtocol: tcp
+      CidrIp: 0.0.0.0/0
+      FromPort: 8080
+      ToPort: 8080
+
+Outputs:
+  ManagerPublicIpForAccess:
+    Description: The Public Ip of the Swarm Manager
+    Value: !GetAtt host1.PublicIp
