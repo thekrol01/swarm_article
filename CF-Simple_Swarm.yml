@@ -55,9 +55,9 @@ Resources:
                 deploy_stack:
                   command: 
                     sudo docker stack deploy -c /tmp/wordpress_stack.yml wordpress
-    # CreationPolicy:
-    #     ResourceSignal:
-    #         Timeout: PT5M
+    CreationPolicy:
+        ResourceSignal:
+            Timeout: PT5M
     Properties:
       ImageId: !Ref LatestLinuxAmiId
       InstanceType: t2.micro
@@ -107,9 +107,9 @@ Resources:
                     #join swarm as worker
                     sudo docker swarm join --token $JOIN_TOKEN ${host1.PrivateIp}
     DependsOn: host1
-    # CreationPolicy:
-    #     ResourceSignal:
-    #         Timeout: PT5M
+    CreationPolicy:
+        ResourceSignal:
+            Timeout: PT5M
     Properties:
       ImageId: !Ref LatestLinuxAmiId
       InstanceType: t2.micro
